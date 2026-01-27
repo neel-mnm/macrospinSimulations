@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+LSlib_test.ipynb
+macrospinLib_tutorial copy.ipynb
+testsMacrospinLS.ipynb
