@@ -209,10 +209,10 @@ class macrospinSystem():
         self.pars["B_dlL"]=Bdl_orbital
         
     def spinOrbitCoupling(self, lambdaSoc=0.01):
-        lambda_soc, muB_L, muB_S = syp.symbols("lambda_LS, muB_L, muB_S")
+        lambda_soc, M_s = syp.symbols("lambda_LS, M_s")
         e,muB = syp.symbols("e,mu_B")
 
-        B_SOC=lambda_soc*q_e/muB
+        B_SOC=lambda_soc*q_e/muB/M_s
         
 
 
@@ -234,7 +234,7 @@ class macrospinSystem():
         dML_dt = self.pars["g_l"]*gamma_base/(1+self.pars["alpha_L"]**2)*(self.ML.cross(Beff_l)/mu0+self.pars["alpha_L"]/(self.pars["M_s"]*self.pars["f_L"])*self.ML.cross(self.ML.cross(Beff_l)/mu0))
         dMS_dt = self.pars["g_s"]*gamma_base/(1+self.pars["alpha_S"]**2)*(self.MS.cross(Beff_s)/mu0+self.pars["alpha_S"]/(self.pars["M_s"]*self.pars["f_S"])*self.MS.cross(self.MS.cross(Beff_s)/mu0))
         
-        return dL_dt, dS_dt 
+        return dML_dt, dMS_dt 
         
     def dynamics(self):
         gL,alphaL,gS,alphaS,mu_B,h_bar,mu_0,MsL,MsS = syp.symbols("g_L,alpha_L,g_S,alpha_S,mu_B,hbar,mu_0,M_s^L,M_s^S")
