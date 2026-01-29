@@ -4,6 +4,12 @@ import sympy as syp
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+gamma0= 1.76e11   #[s T]^-1
+hbar = 	1.054571817e-34 #[J s]
+muB = 9.2740100657e-24 #[J T-1]
+q_e = 1.60217663e-19 #Coulomb
+
+
 def get_vector(theta,phi):
     # converts (theta,phi)-->(mx,my,mz)
     theta,phi=np.deg2rad(theta),np.deg2rad(phi)
@@ -22,10 +28,10 @@ def normConstraint(x,norm):
     return x[0]**2+x[1]**2+x[2]**2-norm
 
 class macrospinSystem():
-    def __init__(self, gl=1, gs=2, quenched = True):
+    def __init__(self, gl=1, gs=2, muB_S=1, muB_L=0, gammaL=0.5*gamma0, gammaS=gamma0, alphaS=0, alphaL=0):
         Sx, Sy, Sz = syp.symbols(r"S_x,S_y,S_z")
         Lx, Ly, Lz = syp.symbols(r"L_x,L_y,L_z")
-        g_l,g_s = syp.symbols(r"g_l,g_s")
+        g_l,g_s,gamma_L, gamma_S, alpha_L, alpha_S = syp.symbols(r"g_l,g_s,gamma_L, gamma_S, alpha_S, alpha_L")
         
         self.S = syp.Matrix([Sx,Sy,Sz])
         self.L = syp.Matrix([Lx,Ly,Lz])
@@ -36,20 +42,29 @@ class macrospinSystem():
         
         self.field=syp.Matrix([0,0,0])
         self.energy=0
+        self.field_L=syp.Matrix([0,0,0])
+        self.field_S=syp.Matrix([0,0,0])
         
         self.pars={}
         self.variables={}
-        if quenched:
+        if muB_L==0:
             self.pars["L_x"]=0
             self.pars["L_y"]=0
             self.pars["L_z"]=0
             self.unknowns={"S_x":1,"S_y":0,"S_z":0}
         else:
             self.unknowns={"S_x":1,"S_y":0,"S_z":0,"L_x":1,"L_y":0,"L_z":0}
+
         self.pars["g_l"]=gl
         self.pars["g_s"]=gs
+        self.pars["gamma_L"]=gammaL
+        self.pars["gamma_S"]=gammaS
+        self.pars["alpha_L"]=alphaL
+        self.pars["alpha_S"]=alphaS
+        self.pars["muB_L"]=muB_L
+        self.pars["muB_S"]=muB_S
         
-    def externalField(self, B0=0, uB=0):
+    def externalField(self, B0=0, uB=[1,0,0]):
         
         Bext,ubx,uby,ubz = syp.symbols(r"B_ext, u_bx, u_by, u_bz")
         
@@ -86,7 +101,10 @@ class macrospinSystem():
         B_ani=Bani*syp.Matrix([ukx,uky,ukz])
         
         if "B_k" not in self.pars:
-            self.field+=B_ani
+            if "L_x" not in self.unknowns:
+                self.field+=B_ani
+            else:
+                self.field_L+=B_ani
             self.energy+=-Bani/2*(self.M.dot(syp.Matrix([ukx,uky,ukz])))**2
             
         
@@ -156,6 +174,27 @@ class macrospinSystem():
         self.pars["B_dlS"]=Bdl_spin
         self.pars["B_dlL"]=Bdl_orbital
         
+    def spinOrbitCoupling(self, lambdaSoc=0.01):
+        lambda_soc, muB_L, muB_S = syp.symbols("lambda_LS, muB_L, muB_S")
+
+
+        B_SOC=lambda_soc*q_e/muB
+
+        if "lambda_LS" not in self.variables:
+            self.energy+=lambda_soc*self.L.dot(self.S)
+            self.field_L+=B_SOC*muB_S*self.S
+            self.field_S+=B_SOC*muB_L*self.L
+        
+        self.pars["lambda_LS"] = lambdaSoc
+    
+    def getTimeEvolutions(self):
+        Beff_s=self.field+self.field_S
+        Beff_l=self.field+self.field_L
+
+        dL_dt = (self.pars["g_l"]*muB/hbar*self.L.cross(Beff_l)+self.pars["g_l"]*muB/hbar*self.pars["alpha_L"]*self.L.cross(self.L.cross(Beff_l)))/(1+self.pars["alpha_L"]**2)
+        dS_dt = (self.pars["g_s"]*muB/hbar*self.S.cross(Beff_s)+self.pars["g_s"]*muB/hbar*self.pars["alpha_S"]*self.S.cross(self.S.cross(Beff_s)))/(1+self.pars["alpha_S"]**2)
+        return dL_dt, dS_dt     
+    
     def getEquilibriumFunction(self, evaluate=True, returnSingle=True):
         TS=self.S.cross(self.field)
         TL=self.L.cross(self.field)
@@ -177,8 +216,7 @@ class macrospinSystem():
             self.Tsqr=T.dot(T)
             simplifiedTsqr=self.Tsqr#syp.nsimplify(self.Tsqr,tolerance=1e-10)
             return syp.lambdify(variables.keys(),simplifiedTsqr)
-    
-    
+
     def sweep_parameters(self,B,u_bx,u_by,u_bz,I, verbose=False, tol=1e-8):
         sweeps=[B,u_bx,u_by,u_bz,I]
         shape=None
