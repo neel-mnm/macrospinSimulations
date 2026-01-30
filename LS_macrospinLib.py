@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import optimize
+from scipy.integrate import solve_ivp
 import sympy as syp
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -32,7 +33,7 @@ class macrospinSystem():
     def __init__(self, gl=1, gs=2, muB_S=1, muB_L=0, gammaL=0.5*gamma0, gammaS=gamma0, alphaS=0, alphaL=0, Ms=1e6, SOC_sign=1):
         Sx, Sy, Sz = syp.symbols(r"S_x,S_y,S_z")
         Lx, Ly, Lz = syp.symbols(r"L_x,L_y,L_z")
-        M_s, fL, fS        = syp.symbols(r"M_s, f_L, f_S")
+        M_s, fL, fS = syp.symbols(r"M_s, f_L, f_S")
         #g_l,g_s,gamma_L, gamma_S, alpha_L, alpha_S = syp.symbols(r"g_l,g_s,gamma_L, gamma_S, alpha_S, alpha_L")
         
         
@@ -41,7 +42,7 @@ class macrospinSystem():
         self.L = syp.Matrix([Lx,Ly,Lz])
         
         #define fractions of magnetization of L and S 
-        mu_total=np.abs(muB_S+SOC_sign*muB_L)
+        mu_total=np.abs(muB_S-SOC_sign*muB_L)
         f_S=muB_S/mu_total
         f_L=muB_L/mu_total
         self.ML=fL*self.L*M_s
@@ -67,12 +68,10 @@ class macrospinSystem():
         self.pars={}
         self.variables={}
         if muB_L==0:
-            self.pars["L_x"]=0
-            self.pars["L_y"]=0
-            self.pars["L_z"]=0
-            self.unknowns={"S_x":1,"S_y":0,"S_z":0}
+            self.quenched=True
         else:
-            self.unknowns={"S_x":1,"S_y":0,"S_z":0,"L_x":1,"L_y":0,"L_z":0}
+            self.quenched=False
+        self.unknowns={"S_x":1,"S_y":0,"S_z":0,"L_x":1,"L_y":0,"L_z":0}
 
         self.pars["g_l"]=gl
         self.pars["g_s"]=gs
@@ -85,6 +84,7 @@ class macrospinSystem():
         self.pars["M_s"]=Ms
         self.pars["f_L"]=f_L
         self.pars["f_S"]=f_S
+        self.pars["mu_B"]=muB
         
     def externalField(self, B0=0, uB=[1,0,0]):
         
@@ -132,7 +132,7 @@ class macrospinSystem():
         nicefield=syp.MatMul(Bani,syp.Matrix([ukx,uky,ukz]),evaluate=False)
         
         if "B_k" not in self.pars:
-            if "L_x" not in self.unknowns:
+            if self.quenched:
                 self.field+=B_ani
                 self.nicefield.append(nicefield)
             else:
@@ -209,19 +209,19 @@ class macrospinSystem():
         self.pars["B_dlL"]=Bdl_orbital
         
     def spinOrbitCoupling(self, lambdaSoc=0.01):
-        lambda_soc, M_s = syp.symbols("lambda_LS, M_s")
+        lambda_soc, M_s, g_s, g_l = syp.symbols("lambda_LS, M_s, g_l, g_s")
         e,muB = syp.symbols("e,mu_B")
 
-        B_SOC=lambda_soc*q_e/muB/M_s
+        B_SOC=-lambda_soc*q_e/muB/M_s
         
 
 
         if "lambda_LS" not in self.variables:
             self.energy+=lambda_soc*self.ML.dot(self.MS)
-            self.field_L+=B_SOC*self.MS
-            self.field_S+=B_SOC*self.ML
-            self.nicefieldL.append(syp.MatMul(lambda_soc/muB,self.niceMS,evaluate=False))
-            self.nicefieldS.append(syp.MatMul(lambda_soc/muB,self.niceML,evaluate=False)) 
+            self.field_L+=B_SOC*self.MS/g_s
+            self.field_S+=B_SOC*self.ML/g_l
+            self.nicefieldL.append(syp.MatMul(lambda_soc/muB/g_s,self.niceMS,evaluate=False))
+            self.nicefieldS.append(syp.MatMul(lambda_soc/muB/g_l,self.niceML,evaluate=False)) 
         
         self.pars["lambda_LS"] = lambdaSoc
     
@@ -230,12 +230,56 @@ class macrospinSystem():
         Beff_l=self.field+self.field_L
         
         gamma_base=-muB/hbar
-
-        dML_dt = self.pars["g_l"]*gamma_base/(1+self.pars["alpha_L"]**2)*(self.ML.cross(Beff_l)/mu0+self.pars["alpha_L"]/(self.pars["M_s"]*self.pars["f_L"])*self.ML.cross(self.ML.cross(Beff_l)/mu0))
-        dMS_dt = self.pars["g_s"]*gamma_base/(1+self.pars["alpha_S"]**2)*(self.MS.cross(Beff_s)/mu0+self.pars["alpha_S"]/(self.pars["M_s"]*self.pars["f_S"])*self.MS.cross(self.MS.cross(Beff_s)/mu0))
+        if self.pars["muB_L"]==0:
+            dML_dt = syp.Matrix([0,0,0])
+        else:
+            dML_dt = self.pars["g_l"]*gamma_base/(1+self.pars["alpha_L"]**2)*(self.ML.cross(Beff_l)+self.pars["alpha_L"]/(self.pars["M_s"]*self.pars["f_L"])*self.ML.cross(self.ML.cross(Beff_l)))/(self.pars["M_s"]*self.pars["f_L"])
+        if self.pars["muB_S"]==0:
+            dMS_dt = syp.Matrix([0,0,0])
+        else:
+            dMS_dt = self.pars["g_s"]*gamma_base/(1+self.pars["alpha_S"]**2)*(self.MS.cross(Beff_s)+self.pars["alpha_S"]/(self.pars["M_s"]*self.pars["f_S"])*self.MS.cross(self.MS.cross(Beff_s)))/(self.pars["M_s"]*self.pars["f_S"])
         
         return dML_dt, dMS_dt 
+    
+    def simulateTimeEvolution(self,S0=[1,0,0], L0=[1,0,0], t_f=10e-9, t_0=0, rel_tol=1e-10, abs_tol = 1e-10, fmrFieldFunction=lambda t:0):
+        dL, dS = self.getTimeEvolutions()
+
+        t_span=(t_0,t_f)
+
+        staticVariables={k: v for k, v in self.variables.items() if k != "j_c"}
+
+        dL_ready, dS_ready = dL.subs(staticVariables | self.pars), dS.subs(staticVariables | self.pars)
+        dJ_ready=syp.Matrix.vstack(dS_ready,dL_ready)
+        dJ_ready=syp.lambdify(["j_c",*self.unknowns.keys()],dJ_ready)
+        dJ_ready_lambda = lambda t,J: dJ_ready(fmrFieldFunction(t),J[0],J[1],J[2],J[3],J[4],J[5]).ravel()
+        J0=np.array([*S0,*L0],dtype=float)
+
+        sol=solve_ivp(
+            dJ_ready_lambda,
+            t_span,
+            J0,
+            rtol=rel_tol,
+            atol=abs_tol
+            )
         
+        Sx = sol.y[0]        
+        Sy = sol.y[1]        
+        Sz = sol.y[2]
+        Lx = sol.y[0+3]        
+        Ly = sol.y[1+3]        
+        Lz = sol.y[2+3]
+
+        
+        results=timeEvolSolution()
+        results.t = sol.t
+        results.S = np.array([Sx,Sy,Sz])
+        results.L = np.array([Lx,Ly,Lz])
+        results.J = self.pars["f_S"]/self.pars["g_s"]*results.S+self.pars["f_L"]/self.pars["g_l"]*results.L
+        results.M = self.pars["M_s"]*(self.pars["f_L"]*results.L+self.pars["f_S"]*results.S)
+        results.pars = self.pars
+        
+        return results
+    
     def dynamics(self):
         gL,alphaL,gS,alphaS,mu_B,h_bar,mu_0,MsL,MsS = syp.symbols("g_L,alpha_L,g_S,alpha_S,mu_B,hbar,mu_0,M_s^L,M_s^S")
         BeffL,BeffS,ML,MS,cross=syp.symbols('B_eff^L,B_eff^S,M_L,M_S,×', commutative=False)
@@ -357,4 +401,8 @@ class macrospinSystem():
                                       tol=tol)
                 sols[n]=sol.x
         return np.array(sols)
-        
+
+
+class timeEvolSolution():
+    def __init__(self):
+        pass
