@@ -42,13 +42,13 @@ class macrospinSystem():
         self.L = syp.Matrix([Lx,Ly,Lz])
         
         #define fractions of magnetization of L and S 
-        mu_total=np.abs(muB_S-SOC_sign*muB_L)
+        mu_total=np.abs(muB_S)+np.abs(muB_L)
         f_S=muB_S/mu_total
         f_L=muB_L/mu_total
         self.ML=fL*self.L*M_s
         self.MS=fS*self.S*M_s
         #define magnetization
-        self.M=self.ML+self.MS
+        self.M=-SOC_sign*self.ML+self.MS
         
         self.niceML=syp.MatMul(fL,M_s,self.L, evaluate=False)
         self.niceMS=syp.MatMul(fS,M_s,self.S, evaluate=False)
@@ -106,10 +106,10 @@ class macrospinSystem():
         self.variables['u_bz']=uB[2]
     
     def demagField(self,N_diag):
-        mu0, Ms, Nxx, Nyy, Nzz = syp.symbols(r'mu_0, M_s,N_xx,N_yy,N_zz')
+        Nxx, Nyy, Nzz = syp.symbols(r'N_xx,N_yy,N_zz')
         N=syp.diag(Nxx,Nyy,Nzz)
         
-        B_dem=-N@self.M
+        B_dem=-N@self.M*mu0
         
         #niceN=syp.Matrix([[Nxx,0,0],[0,Nyy,0],[0,0,Nzz]])
 
@@ -133,10 +133,10 @@ class macrospinSystem():
         
         if "B_k" not in self.pars:
             if self.quenched:
-                self.field+=B_ani
+                self.field+=B_ani*self.S.dot(syp.Matrix([ukx,uky,ukz]))
                 self.nicefield.append(nicefield)
             else:
-                self.field_L+=B_ani
+                self.field_L+=B_ani*self.L.dot(syp.Matrix([ukx,uky,ukz]))
                 self.nicefieldL.append(nicefield)
             self.energy+=-Bani/2*(self.M.dot(syp.Matrix([ukx,uky,ukz])))**2
             
@@ -187,10 +187,18 @@ class macrospinSystem():
             print("Error: no charge current")
             return
         B_fls,B_fll=syp.symbols("B_flS,B_flL")
-        B=B_fll*self.l+B_fls*self.s
+        if hasattr(self,"l"):
+            BL=B_fll*self.l
+        else:
+            BL=syp.Matrix([0,0,0])
+        BS=B_fls*self.s
         
         if "B_flS" not in self.pars:
-            self.field+=B
+            if self.quenched:
+                self.field+=BL+BS
+            else:
+                self.field_S+=BS
+                self.field_L+=BL
         
         self.pars["B_flS"]=Bfl_spin
         self.pars["B_flL"]=Bfl_orbital
@@ -200,10 +208,19 @@ class macrospinSystem():
             print("Error: no charge current")
             return
         B_dls,B_dll=syp.symbols("B_dlS,B_dlL")
-        B=B_dll*self.l.cross(self.M)+B_dls*self.s.cross(self.M)
+        if hasattr(self,"l"):
+            BL=B_dll*self.l.cross(self.M)/self.pars["M_s"]
+        else:
+            BL=syp.Matrix([0,0,0])
+        BS=+B_dls*self.s.cross(self.M)/self.pars["M_s"]
         
         if "B_dlS" not in self.pars:
-            self.field+=B
+            if self.quenched:
+                self.field+=BL+BS
+            else:
+                self.field_S+=BS
+                self.field_L+=BL
+        
         
         self.pars["B_dlS"]=Bdl_spin
         self.pars["B_dlL"]=Bdl_orbital
@@ -217,7 +234,7 @@ class macrospinSystem():
 
 
         if "lambda_LS" not in self.variables:
-            self.energy+=lambda_soc*self.ML.dot(self.MS)
+            self.energySOC=lambda_soc*self.ML.dot(self.MS)
             self.field_L+=B_SOC*self.MS/g_s
             self.field_S+=B_SOC*self.ML/g_l
             self.nicefieldL.append(syp.MatMul(lambda_soc/muB/g_s,self.niceMS,evaluate=False))
@@ -241,7 +258,7 @@ class macrospinSystem():
         
         return dML_dt, dMS_dt 
     
-    def simulateTimeEvolution(self,S0=[1,0,0], L0=[1,0,0], t_f=10e-9, t_0=0, rel_tol=1e-10, abs_tol = 1e-10, fmrFieldFunction=lambda t:0):
+    def simulateTimeEvolution(self,S0=[1,0,0], L0=[1,0,0], t_f=10e-9, t_0=0, rel_tol=1e-10, abs_tol = 1e-10, fmrFieldFunction=lambda t:0, relaxfirst=True, method = "Radau"):
         dL, dS = self.getTimeEvolutions()
 
         t_span=(t_0,t_f)
@@ -250,16 +267,28 @@ class macrospinSystem():
 
         dL_ready, dS_ready = dL.subs(staticVariables | self.pars), dS.subs(staticVariables | self.pars)
         dJ_ready=syp.Matrix.vstack(dS_ready,dL_ready)
+
+        J = syp.Matrix.vstack(self.S, self.L)
+        Jac_dJ_ready = dJ_ready.jacobian(J)
+
         dJ_ready=syp.lambdify(["j_c",*self.unknowns.keys()],dJ_ready)
         dJ_ready_lambda = lambda t,J: dJ_ready(fmrFieldFunction(t),J[0],J[1],J[2],J[3],J[4],J[5]).ravel()
+
+        Jac_dJ_ready=syp.lambdify(["j_c",*self.unknowns.keys()],Jac_dJ_ready)
+        Jac_dJ_ready_lambda = lambda t,J: Jac_dJ_ready(fmrFieldFunction(t),J[0],J[1],J[2],J[3],J[4],J[5])
+
         J0=np.array([*S0,*L0],dtype=float)
+        if relaxfirst:
+            J0=self.gotoEquilibrium_3d(self.variables["B_ext"],self.variables["u_bx"],self.variables["u_by"],self.variables["u_bz"], 0, J0)
 
         sol=solve_ivp(
             dJ_ready_lambda,
             t_span,
             J0,
             rtol=rel_tol,
-            atol=abs_tol
+            atol=abs_tol,
+            jac = Jac_dJ_ready_lambda,
+            method = method
             )
         
         Sx = sol.y[0]        
@@ -270,7 +299,7 @@ class macrospinSystem():
         Lz = sol.y[2+3]
 
         
-        results=timeEvolSolution()
+        results=macrospinSolution()
         results.t = sol.t
         results.S = np.array([Sx,Sy,Sz])
         results.L = np.array([Lx,Ly,Lz])
@@ -297,32 +326,30 @@ class macrospinSystem():
         
         return nicedL_dT, nicedS_dT
         
+    def getEquilibriumSystem(self):
+        dL, dS = self.getTimeEvolutions()
+        norm_constraint_S = syp.Matrix([normConstraint(self.S,1)])
+        norm_constraint_L = syp.Matrix([normConstraint(self.L,1)])
+        J = syp.Matrix.vstack(self.S, self.L)
+        system=syp.Matrix([dS[0],dS[1],dL[0],dL[1],norm_constraint_L,norm_constraint_S])
+        jac = system.jacobian(J)
 
+        system = system.subs({"alpha_L":0,"alpha_S":0})
+        jac = jac.subs({"alpha_L":0,"alpha_S":0})
+
+        system = system.subs(self.pars)
+        jac = jac.subs(self.pars)
+        
+        system_ready=syp.lambdify([*self.variables.keys(),*self.unknowns.keys()],system)
+        system_lambda = lambda J, B, bx, by, bz, j_c: system_ready(B,bx,by,bz,j_c,J[0],J[1],J[2],J[3],J[4],J[5]).ravel()
+
+        jac_ready=syp.lambdify([*self.variables.keys(),*self.unknowns.keys()],jac)
+        jac_lambda = lambda J, B, bx, by, bz, j_c: jac_ready(B,bx,by,bz,j_c,J[0],J[1],J[2],J[3],J[4],J[5])
+
+        return system_lambda, jac_lambda
     
-    def getEquilibriumFunction(self, evaluate=True, returnSingle=True):
-        TS=self.S.cross(self.field)
-        TL=self.L.cross(self.field)
-        
-        variables = self.variables | self.unknowns
-        
-        if evaluate:
-            TL=TL.subs(self.pars)
-            TS=TS.subs(self.pars)
-        if not returnSingle:            
-            self.TLsqr=TL.dot(TL)
-            self.TSsqr=TS.dot(TS)
-            simplifiedTLsqr=syp.nsimplify(self.TLsqr, tolerance=1e-10)
-            simplifiedTSsqr=syp.nsimplify(self.TSsqr, tolerance=1e-10)
-
-            return syp.lambdify(variables.keys(),simplifiedTLsqr),syp.lambdify(self.variables.keys(),simplifiedTSsqr)
-        else:
-            T=TS+TL
-            self.Tsqr=T.dot(T)
-            simplifiedTsqr=self.Tsqr#syp.nsimplify(self.Tsqr,tolerance=1e-10)
-            return syp.lambdify(variables.keys(),simplifiedTsqr)
-
-    def sweep_parameters(self,B,u_bx,u_by,u_bz,I, verbose=False, tol=1e-8):
-        sweeps=[B,u_bx,u_by,u_bz,I]
+    def sweepEquilibrium(self, B, thetaB, phiB, j_c, guesses, muteOuts=False, tol = 1e-10):
+        sweeps = [B,thetaB,phiB,j_c]
         shape=None
         # make all sweeps the right size
         for sweep in sweeps:
@@ -334,75 +361,166 @@ class macrospinSystem():
         for n,sweep in enumerate(sweeps):
             if isinstance(sweep,(int,float)):
                 sweeps[n]=[sweep for i in range(shape)]
-        self.sweeps = sweeps
-        Tsqred=self.getEquilibriumFunction()
-        Tsqr=lambda dirs, B0, ubx, uby, ubz, j : Tsqred(B0, ubx, uby, ubz, j, *dirs)
-        B, u_bx, u_by, u_bz, I= sweeps
+
+        B , thetaB, phiB, j_c = sweeps
+        uB = get_vector(np.array(thetaB), np.array(phiB))
+        ux,uy,uz = uB[:,0],uB[:,1],uB[:,2]
+
+        guesses = np.asarray(guesses)
+        if guesses.ndim == 1:
+            if not muteOuts:
+                print("Solution following enabled")
+            autoGuess = True
+
+        system, jacobian = self.getEquilibriumSystem()
+
+        eqs = [0]* len(B)
+        for n,(Bext,ubx, uby, ubz,jc) in enumerate(zip(B, ux, uy, uz,j_c)):
+            if n == 0:
+                guess = guesses
+            elif autoGuess:
+                guess = eqs[n-1]
+            else:
+                guess = guesses[n]
+            solution = optimize.fsolve(system, x0=guess, fprime = jacobian, args=(Bext,ubx,uby,ubz,jc), xtol=tol)
+            eqs[n]=solution#.x
         
-        sols=[0]*len(B)
+        eqs = np.array(eqs)
         
-        if "L_x" in self.unknowns:
-            for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(sweeps)):
+        results=macrospinSolution()
+        results.B = B
+        results.S = eqs[:,:3]
+        results.L = eqs[:,3:]
+        results.J = self.pars["f_S"]/self.pars["g_s"]*results.S+self.pars["f_L"]/self.pars["g_l"]*results.L
+        results.M = self.pars["M_s"]*(self.pars["f_L"]*results.L+self.pars["f_S"]*results.S)
+        results.j_c = jc
+        results.pars = self.pars
         
-        
-        
-                sol=optimize.minimize(Tsqr,[ubx,uby,ubz,ubx,uby,ubz], args=(B0, ubx, uby, ubz))
-                sols[n]=sol.x
-        else:
-            for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(zip(*sweeps))):
-                constraint  = lambda dirs: normConstraint(dirs,1)
-                constraints = [
-                    {'type': 'eq', 'fun': constraint}
-                    ]
-                sol=optimize.minimize(Tsqr,
-                                      [ubx,uby,ubz],
-                                      args=(B0, ubx, uby, ubz, I),
-                                      constraints=constraints,
-                                      method="SLSQP",
-                                      tol=tol)
-                sols[n]=sol.x
-        return np.array(sols)
+        return results
     
-    def sweep_parameters_angle(self,B,thetaB, phiB ,I, verbose=False, tol=1e-8):
-        uB=get_vector(thetaB,phiB)
-        u_bx,u_by,u_bz=uB[:,0],uB[:,1],uB[:,2]
-        sweeps=[B,u_bx,u_by,u_bz,I,thetaB,phiB]
-        shape=None
-        # make all sweeps the right size
-        for sweep in sweeps:
-            if not isinstance(sweep, (int,float)):
-                if shape is not None and shape!=len(sweep):
-                    print("Incompatible sweeps")
-                    return
-                shape=len(sweep)
-        for n,sweep in enumerate(sweeps):
-            if isinstance(sweep,(int,float)):
-                sweeps[n]=[sweep for i in range(shape)]
-        self.sweeps = sweeps
-        Tsqred=self.getEquilibriumFunction()
-        Tsqr=lambda angles, B0, ubx, uby, ubz, j : Tsqred(B0, ubx, uby, ubz, j, *get_vector(*angles))
-        B, u_bx, u_by, u_bz, I, thetaB, phiB= sweeps
+    def gotoEquilibrium_3d(self, B, ux, uy, uz, j_c, guesses):
         
-        sols=[0]*len(B)
-        
-        if "L_x" in self.unknowns:
-            for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(sweeps)):
-        
-        
-        
-                sol=optimize.minimize(Tsqr,[ubx,uby,ubz,ubx,uby,ubz], args=(B0, ubx, uby, ubz))
-                sols[n]=sol.x
-        else:
-            for n,(B0, ubx, uby, ubz, I, theta, phi) in tqdm(enumerate(zip(*sweeps))):
-                sol=optimize.minimize(Tsqr,
-                                      [theta,phi],
-                                      args=(B0, ubx, uby, ubz, I),
-                                      method="SLSQP",
-                                      tol=tol)
-                sols[n]=sol.x
-        return np.array(sols)
+        system, jacobian = self.getEquilibriumSystem()
+        solution = optimize.fsolve(system, x0=guesses, fprime = jacobian, args=(B,ux,uy,uz,j_c))
+        return np.array(solution)
+
+    def relaxSystem(self,B,bx,by,bz,initialPosition, tol=1e-11):
+            energy = self.energy+self.energySOC
+            energy = energy.subs(self.pars)
+            
+            energy=energy.subs({"B_ext":B,"u_bx":bx,"u_by":by,"u_bz":bz, "j_c":0})
+            print(energy)
+            energy_ready=syp.lambdify([*self.unknowns.keys()],energy)
+            energy_lambda = lambda J: energy_ready(J[0],J[1],J[2],J[3],J[4],J[5])
+            J = syp.Matrix.vstack(self.S, self.L)
+            d_energy = syp.derive_by_array(energy,J)
+            d_energy_ready=syp.lambdify([*self.unknowns.keys()],d_energy)
+            d_energy_lambda = lambda J: d_energy_ready(J[0],J[1],J[2],J[3],J[4],J[5])
+
+            normS = lambda J: J[0]**2+J[1]**2+J[2]**2-1
+            normL = lambda J: J[3]**2+J[4]**2+J[5]**2-1
+
+            system = lambda J: np.array([d_energy_lambda(J), normS(J), normL(J)])
+
+            #if "lambda_LS" in self.pars.keys():
+            #    relativeDir= lambda J: J[0:3]+self.pars["lambda_LS"]/np.abs(self.pars["lambda_LS"])*J[3:]
+
+            #    constraints = [
+            #    {'type': 'eq', 'fun': normS},
+            #    {'type': 'eq', 'fun': normL},
+            #    {'type': 'eq', 'fun': relativeDir},
+            #    ]
+            #else:
+            #    constraints = [
+            #    {'type': 'eq', 'fun': normS},
+            #    {'type': 'eq', 'fun': normL}]
+
+            #return optimize.minimize(energy_lambda,initialPosition,constraints=constraints, tol=tol).x
+
+            return optimize.fsolve(system,initialPosition)
+
+    #def sweep_parameters(self,B,u_bx,u_by,u_bz,I, verbose=False, tol=1e-8):
+    #    sweeps=[B,u_bx,u_by,u_bz,I]
+    #    shape=None
+    #    # make all sweeps the right size
+    #    for sweep in sweeps:
+    #        if not isinstance(sweep, (int,float)):
+    #            if shape is not None and shape!=len(sweep):
+    #                print("Incompatible sweeps")
+    #                return
+    #            shape=len(sweep)
+    #    for n,sweep in enumerate(sweeps):
+    #        if isinstance(sweep,(int,float)):
+    #            sweeps[n]=[sweep for i in range(shape)]
+    #    self.sweeps = sweeps
+    #    Tsqred=self.getEquilibriumFunction()
+    #    Tsqr=lambda dirs, B0, ubx, uby, ubz, j : Tsqred(B0, ubx, uby, ubz, j, *dirs)
+    #    B, u_bx, u_by, u_bz, I= sweeps
+    #    
+    #    sols=[0]*len(B)
+    #    
+    #    if "L_x" in self.unknowns:
+    #        for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(sweeps)):
+    #    
+    #    
+    #    
+    #            sol=optimize.minimize(Tsqr,[ubx,uby,ubz,ubx,uby,ubz], args=(B0, ubx, uby, ubz))
+    #            sols[n]=sol.x
+    #    else:
+    #        for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(zip(*sweeps))):
+    #            constraint  = lambda dirs: normConstraint(dirs,1)
+    #            constraints = [
+    #                {'type': 'eq', 'fun': constraint}
+    #                ]
+    #            sol=optimize.minimize(Tsqr,
+    #                                  [ubx,uby,ubz],
+    #                                  args=(B0, ubx, uby, ubz, I),
+    #                                  constraints=constraints,
+    #                                  method="SLSQP",
+    #                                  tol=tol)
+    #            sols[n]=sol.x
+    #    return np.array(sols)
+    #
+    #def sweep_parameters_angle(self,B,thetaB, phiB ,I, verbose=False, tol=1e-8):
+    #    uB=get_vector(thetaB,phiB)
+    #    u_bx,u_by,u_bz=uB[:,0],uB[:,1],uB[:,2]
+    #    sweeps=[B,u_bx,u_by,u_bz,I,thetaB,phiB]
+    #    shape=None
+    #    # make all sweeps the right size
+    #    for sweep in sweeps:
+    #        if not isinstance(sweep, (int,float)):
+    #            if shape is not None and shape!=len(sweep):
+    #                print("Incompatible sweeps")
+    #                return
+    #            shape=len(sweep)
+    #    for n,sweep in enumerate(sweeps):
+    #        if isinstance(sweep,(int,float)):
+    #            sweeps[n]=[sweep for i in range(shape)]
+    #    self.sweeps = sweeps
+    #    Tsqred=self.getEquilibriumFunction()
+    #    Tsqr=lambda angles, B0, ubx, uby, ubz, j : Tsqred(B0, ubx, uby, ubz, j, *get_vector(*angles))
+    #    B, u_bx, u_by, u_bz, I, thetaB, phiB= sweeps
+    #    
+    #    sols=[0]*len(B)
+    #    
+    #    if "L_x" in self.unknowns:
+    #        for n,(B0, ubx, uby, ubz, I) in tqdm(enumerate(sweeps)):
+    #    
+    #    
+    #    
+    #            sol=optimize.minimize(Tsqr,[ubx,uby,ubz,ubx,uby,ubz], args=(B0, ubx, uby, ubz))
+    #            sols[n]=sol.x
+    #    else:
+    #        for n,(B0, ubx, uby, ubz, I, theta, phi) in tqdm(enumerate(zip(*sweeps))):
+    #            sol=optimize.minimize(Tsqr,
+    #                                  [theta,phi],
+    #                                  args=(B0, ubx, uby, ubz, I),
+    #                                  method="SLSQP",
+    #                                  tol=tol)
+    #            sols[n]=sol.x
+    #    return np.array(sols)
 
 
-class timeEvolSolution():
+class macrospinSolution():
     def __init__(self):
         pass
