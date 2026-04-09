@@ -209,3 +209,6 @@ __marimo__/
 LSlib_test.ipynb
 macrospinLib_tutorial copy.ipynb
 testsMacrospinLS.ipynb
+plotResponses.py
+quickmacrospin.ipynb
+symAnalysis.ipynb
