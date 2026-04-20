@@ -5,7 +5,10 @@ import matplotlib.pyplot as plt
 import copy
 import os
 import pickle as pkl
+import tqdm
 from scipy.interpolate import interp1d
+from scipy.signal import find_peaks
+from numba.core.registry import CPUDispatcher
 
 gamma0 = 1.76e11
 hbar = 1.054571817e-34
@@ -19,20 +22,8 @@ mu0 = 4*np.pi*1e-7
 #UTILITIES
 #=========
 @njit
-def cross_inline(ax, ay, az, bx, by, bz):
-    return (
-        ay*bz - az*by,
-        az*bx - ax*bz,
-        ax*by - ay*bx
-    )
-
-@njit
-def dot_inline(a, b):
-    return np.array((i*j for i,j in zip(a,b)))
-
-@njit
-def noEffect(t):
-    return 0
+def noEffect(t, shape):
+    return np.zeros(shape)
         
 def sanitizeParameters(parameters):
     for key in parameters:
@@ -45,372 +36,445 @@ def sanitizeParameters(parameters):
             parameters[key] = bool(val)
     return parameters
 
-#===========
-# Field and LLG definition
 
-def totalField_multi(parameters_list):
-    
-    #unpack parameters
-    B0_list = np.array([parameters["B0"] for parameters in parameters_list])
-    uB_list = np.array([parameters["uB"]  for parameters in parameters_list])
-    M_list = np.array([parameters["M"] for parameters in parameters_list])
-    N_diag_list = np.array([parameters["N_diag"] for parameters in parameters_list])
-    Bk_list = np.array([parameters["Bk"] for parameters in parameters_list])
-    uK_list = np.array([parameters["uK"] for parameters in parameters_list])
-    anisotropy_affects_S_list = np.array([parameters["anisotropy_affects_S"] for parameters in parameters_list])
-    BOe_list = np.array([parameters["BOe"] for parameters in parameters_list])
-    Bfl_l_list = np.array([parameters["Bfl_l"] for parameters in parameters_list])
-    Bdl_l_list = np.array([parameters["Bdl_l"] for parameters in parameters_list])
-    Bfl_s_list = np.array([parameters["Bfl_s"] for parameters in parameters_list])
-    Bdl_s_list = np.array([parameters["Bdl_s"] for parameters in parameters_list])
-    s_list = np.array([parameters["s"] for parameters in parameters_list])
-    l_list = np.array([parameters["l"] for parameters in parameters_list])
-    Bso_list = np.array([parameters["Bso"] for parameters in parameters_list])
-    S_fraction_list = np.array([parameters["S_fraction"] for parameters in parameters_list])
-    gL_list, gS_list = np.array([parameters["gL"] for parameters in parameters_list]),np.array([parameters["gS"]  for parameters in parameters_list])
+@njit
+def RK4_integrator(J0, t0, tf, dt, func):
+    n_step = int((tf-t0)/dt)
+    N = J0.shape[1]
 
-    lattice_number = len(parameters_list)
-    
+    J = np.empty((6,N,n_step+1), dtype = np.float64)
+    timesteps = np.empty(n_step+1, dtype = np.float64)
+
+    J[:,:,0]=J0
+    timesteps[0] = t0
+
+    for i in range(n_step):
+        t = timesteps[i]
+        y = J[:,:,i]
+        k1 = func(t,y)
+        k2 = func(t+0.5*dt, y+0.5*dt*k1)
+        k3 = func(t+0.5*dt, y+0.5*dt*k2)
+        k4 = func(t+dt, y+dt*k3)
+
+        J[:,:,i+1] = y+dt/6*(k1+2*k2+2*k3+k4)
+        timesteps[i+1] = t+dt
+    return timesteps, J
+
+@njit
+def RK4_stream_integrator(J0, t0, tf, dt, func, save_every = 100):
+    n_step = int((tf-t0)/dt)
+    N = J0.shape[1]
+
+    y = J0.astype(np.float64)
+    t = t0
+
+    n_save = n_step//save_every + 1
+    J_save = np.empty((6,N,n_save))
+    t_save = np.empty(n_save)
+
+    save_idx = 0
+    J_save[:,:,save_idx] = J0
+    t_save[save_idx]=t0
+    save_idx+=1
+
+
+    for i in range(n_step):
+        k1 = func(t,y)
+        k2 = func(t+0.5*dt, y+0.5*dt*k1)
+        k3 = func(t+0.5*dt, y+0.5*dt*k2)
+        k4 = func(t+dt, y+dt*k3)
+
+        y += dt/6*(k1+2*k2+2*k3+k4)
+        t+=dt
+
+        if i%save_every == 0:
+            J_save[:,:,save_idx] = y
+            t_save[save_idx] = t
+            save_idx+=1
+
+    return t_save, J_save
+
+
+
+class SimulationParams:
+    def __init__(self, plist):
+        self.B0 = np.array([p["B0"] for p in plist], dtype=np.float64)
+        self.uB = np.array([p["uB"] for p in plist], dtype=np.float64)
+
+        self.M = np.array([p["M"] for p in plist], dtype=np.float64)
+        self.N_diag = np.array([p["N_diag"] for p in plist], dtype=np.float64)
+
+        self.Bk = np.array([p["Bk"] for p in plist], dtype=np.float64)
+        self.uK = np.array([p["uK"] for p in plist], dtype=np.float64)
+
+        self.anisotropy_affects_S = np.array(
+            [p["anisotropy_affects_S"] for p in plist], dtype=np.float64
+        )
+
+        self.BOe = np.array([p["BOe"] for p in plist], dtype=np.float64)
+
+        self.Bso = np.array([p["Bso"] for p in plist], dtype=np.float64)
+
+        self.S_fraction = np.array([p["S_fraction"] for p in plist], dtype=np.float64)
+
+        self.gL = np.array([p["gL"] for p in plist], dtype=np.float64)
+        self.gS = np.array([p["gS"] for p in plist], dtype=np.float64)
+        self.alphaL = np.array([p["alphaL"] for p in plist], dtype=np.float64)
+        self.alphaS = np.array([p["alphaS"] for p in plist], dtype=np.float64)
+
+        self.s = np.array([p["s"] for p in plist], dtype=np.float64)
+        self.l = np.array([p["l"] for p in plist], dtype=np.float64)
+        self.Bfl_l = np.array([p["Bfl_l"] for p in plist], dtype = np.float64)
+        self.Bdl_l = np.array([p["Bdl_l"] for p in plist], dtype = np.float64)
+        self.Bfl_s = np.array([p["Bfl_s"] for p in plist], dtype = np.float64)
+        self.Bdl_s = np.array([p["Bdl_s"] for p in plist], dtype = np.float64)
+
+        self.N = len(plist)
+
+        self.useB0   =     bool(np.any(self.B0 !=0))  
+        self.useM    =     bool(np.any(self.M  !=0))
+        self.useBk   =     bool(np.any(self.Bk !=0))
+        self.useBoe  =     bool(np.any(self.BOe!=0))
+        self.useBso  =     bool(np.any(self.Bso!=0))
+        self.useBfl_l=     bool(np.any(self.Bfl_l!=0))
+        self.useBfl_s=     bool(np.any(self.Bfl_s!=0))
+        self.useBdl_l=     bool(np.any(self.Bdl_l!=0))
+        self.useBdl_s=     bool(np.any(self.Bdl_s!=0))
+
+
+
+def make_effective_field(parameters: SimulationParams):
+    useB0   =parameters.useB0   
+    useM    =parameters.useM    
+    useBk   =parameters.useBk   
+    useBoe  =parameters.useBoe  
+    useBso  =parameters.useBso  
+    useBfl_l=parameters.useBfl_l
+    useBfl_s=parameters.useBfl_s
+    useBdl_l=parameters.useBdl_l
+    useBdl_s=parameters.useBdl_s
+
+
+    N = parameters.N
+    B0_set = parameters.B0
+    uB_set = parameters.uB
+    M_set = parameters.M
+    S_frac_set = parameters.S_fraction
+    N_diag_set = parameters.N_diag
+    Bk_set = parameters.Bk
+    uK_set = parameters.uK
+    ani_on_S_set = parameters.anisotropy_affects_S
+    BOe_set = parameters.BOe
+    BSo_set = parameters.Bso
+    gL_set = parameters.gL
+    gS_set = parameters.gS
+    s_set = parameters.s
+    l_set = parameters.l
+    Bfl_l_set = parameters.Bfl_l
+    Bfl_s_set = parameters.Bfl_s
+    Bdl_l_set = parameters.Bdl_l
+    Bdl_s_set = parameters.Bdl_s    
+
+
     @njit
-    def toReturn(I_list,J_total):
-        out = np.zeros(6*lattice_number, dtype=np.float64)
-        for i in range(lattice_number):
-            lattice_index = 6*i
+    def toReturn(I, J):
+        out = np.empty((6,N), dtype = np.float64)
+        for i in range(N):
             
-            #utilities for not evaluating things over too many loops
-            B0 = B0_list[i]
-            uB = uB_list[i]
-            
-            
-            Ms = M_list[i]
-            S_fraction = S_fraction_list[i]
-            N_diag = N_diag_list[i]
-            
-            
-            uK = uK_list[i]
-            Bk = Bk_list[i]
-            anisotropy_affects_S = anisotropy_affects_S_list[i]
-            uK_dot_L = J_total[lattice_index+3]*uK[0]+J_total[lattice_index+4]*uK[1]+J_total[lattice_index+5]*uK[2]
-            uK_dot_S = anisotropy_affects_S*(J_total[lattice_index]*uK[0]+J_total[lattice_index+1]*uK[1]+J_total[lattice_index+2]*uK[2])
-            
-            
-            BOe = BOe_list[i]*I_list[i]
-            out[lattice_index+1] = BOe
-            out[lattice_index+4] = BOe
-            
-            
-            Bso = Bso_list[i]
-            gL = gL_list[i]
-            gS = gS_list[i]
-            
-            for j in range(3):
-                #external field
-                val = B0*uB[j]
-                out[lattice_index+j]    = out[lattice_index+j]   + val
-                out[lattice_index+j+3]  = out[lattice_index+j+3] + val
-                
-                
-                
-                #demag field
-                M_ij = mu0 * Ms * (S_fraction * J_total[lattice_index+j] + (1-S_fraction) * J_total[lattice_index+j+3])
-                val = -N_diag[j]*M_ij
-                
-                out[lattice_index+j]   = out[lattice_index+j]   + val 
-                out[lattice_index+j+3] = out[lattice_index+j+3] + val
-                
+            Sx = J[0,i]
+            Sy = J[1,i]
+            Sz = J[2,i]
+            Lx = J[3,i]
+            Ly = J[4,i]
+            Lz = J[5,i]
+
+            out_sx=0
+            out_sy=0
+            out_sz=0
+            out_lx=0
+            out_ly=0
+            out_lz=0
 
 
-                #uniaxial anisotropy
-                out[lattice_index+j]  = out[lattice_index+j]   + Bk * uK_dot_S * uK[j]
-                out[lattice_index+j+3]= out[lattice_index+j+3] + Bk * uK_dot_L * uK[j]
+            #external field
+            if useB0:
+                B0 = B0_set[i]
+                uBx, uBy, uBz = uB_set[i]
                 
-                
-                
-                #Oersted Field is j- independent so it's dealt with in the outer loop
+                out_sx +=  B0 * uBx                
+                out_sy +=  B0 * uBy
+                out_sz +=  B0 * uBz
+                out_lx +=  B0 * uBx
+                out_ly +=  B0 * uBy
+                out_lz +=  B0 * uBz
 
+            #demag field
+            if useM:
+                M = M_set[i]
+                f_S = S_frac_set[i]
+                Nx, Ny, Nz = N_diag_set[i]
                 
-                #Spin-Orbit field
-                out[lattice_index+j]  = out[lattice_index+j]   + (1-S_fraction) * Bso * J_total[lattice_index+j+3]/gL
-                out[lattice_index+j+3]= out[lattice_index+j+3] + S_fraction *     Bso * J_total[lattice_index+j]/gS
+                Mx = mu0*M*(f_S * Sx + (1-f_S)*Lx)
+                My = mu0*M*(f_S * Sy + (1-f_S)*Ly)
+                Mz = mu0*M*(f_S * Sz + (1-f_S)*Lz)
                 
+                out_sx +=  -Mx * Nx
+                out_sy +=  -My * Ny
+                out_sz +=  -Mz * Nz
+                out_lx +=  -Mx * Nx
+                out_ly +=  -My * Ny
+                out_lz +=  -Mz * Nz
 
-        #out[np.abs(out) < 1e-10] = 0.0
+            #uniaxial anisotropy
+            if useBk:
+                Bk = Bk_set[i]
+                uKx, uKy, uKz = uK_set[i]
+
+                uK_dot_L = uKx*Lx + uKy*Ly + uKz*Lz
+                uK_dot_S = ani_on_S_set[i]*(uKx*Sx + uKy*Sy + uKz*Sz)
+                
+                out_sx +=  Bk * uK_dot_S * uKx                
+                out_sy +=  Bk * uK_dot_S * uKy
+                out_sz +=  Bk * uK_dot_S * uKz
+                out_lx +=  Bk * uK_dot_L * uKx
+                out_ly +=  Bk * uK_dot_L * uKy
+                out_lz +=  Bk * uK_dot_L * uKz
+
+            #Oersted
+            if useBoe:
+                BOe = BOe_set[i] * I[i]
+
+                out_sy +=  BOe
+                out_ly +=  BOe
+
+            
+            #spin orbit
+            if useBso:
+                Bso = BSo_set[i]
+                gL = gL_set[i]
+                gS = gS_set[i]
+                f_S = S_frac_set[i]
+
+                out_sx += Bso * (1-f_S) * Lx/gL
+                out_sy += Bso * (1-f_S) * Ly/gL
+                out_sz += Bso * (1-f_S) * Lz/gL
+                out_lx += Bso * f_S * Sx/gS
+                out_ly += Bso * f_S * Sy/gS                    
+                out_lz += Bso * f_S * Sz/gS                                
+                                    
+                                    
+            #fieldLike
+            if useBfl_s:
+                sx,sy,sz = s_set[i]
+                Bfl_s = Bfl_s_set[i] * I[i]
+                out_sx += Bfl_s * sx 
+                out_sy += Bfl_s * sy
+                out_sz += Bfl_s * sz
+
+            if useBfl_l:
+                lx,ly,lz = l_set[i]
+                Bfl_l = Bfl_l_set[i] * I[i]
+                out_lx += Bfl_l * lx 
+                out_ly += Bfl_l * ly
+                out_lz += Bfl_l * lz
+
+
+            #dampingLike
+            if useBdl_s:
+                sx,sy,sz = s_set[i]
+                cross_x = sz*Sy - sy*Sz
+                cross_y = -sz*Sx + sx*Sz
+                cross_z = sy*Sx - sx*Sy
+                Bdl_s = Bdl_s_set[i] * I[i]
+                out_sx += Bdl_s * cross_x 
+                out_sy += Bdl_s * cross_y
+                out_sz += Bdl_s * cross_z
+
+            if useBdl_l:
+                lx,ly,lz = l_set[i]
+                cross_x = lz*Ly - ly*Lz
+                cross_y = -lz*Lx + lx*Lz
+                cross_z = ly*Lx - lx*Ly
+                Bdl_l = Bdl_l_set[i] * I[i]
+                out_lx += Bdl_l * cross_x 
+                out_ly += Bdl_l * cross_y
+                out_lz += Bdl_l * cross_z
+
+            
+            out[0,i] = out_sx
+            out[1,i] = out_sy
+            out[2,i] = out_sz
+            out[3,i] = out_lx
+            out[4,i] = out_ly
+            out[5,i] = out_lz
+
         return out
-        
     return toReturn
 
 
-def get_LLGs_multi(parameters_list, dynamics = "full"):
-    alphaS_list = np.array([parameters["alphaS"] for parameters in parameters_list])
-    alphaL_list = np.array([parameters["alphaL"] for parameters in parameters_list])
-    gL_list = np.array([parameters["gL"] for parameters in parameters_list])
-    gS_list = np.array([parameters["gS"] for parameters in parameters_list])
+def get_LLGs(parameters: SimulationParams, dynamics = "full", currentFunc = None):
+    alphaS_set = parameters.alphaS
+    alphaL_set = parameters.alphaL
+    gS_set = parameters.gS
+    gL_set = parameters.gL
+    N = parameters.N
 
     gamma_base = -muB / hbar
-    prefactors_S = gS_list * gamma_base / (1 + alphaS_list**2)
-    prefactors_L = gL_list * gamma_base / (1 + alphaL_list**2)
+    prefactors_S = gS_set * gamma_base / (1 + alphaS_set**2)
+    prefactors_L = gL_set * gamma_base / (1 + alphaL_set**2)
 
-    
-    
-    B_func = totalField_multi(parameters_list)
+    field_func = make_effective_field(parameters)
 
-    lattice_number = len(parameters_list)
-    dataset_length = 6*len(parameters_list)
-    
-    @njit
-    def fullLLGs(I_list,J_total):
-        dJdt = np.empty(dataset_length, dtype=np.float64)
-        B = B_func(I_list, J_total)
+    fullMode = dynamics=="full"
+    dampingMode = dynamics=="damping"
+    precessionMode = dynamics=="precession"
 
-        for i in range(lattice_number):
-            lattice_position = 6*i
-
-            # --- S ---
-            px, py, pz = cross_inline(J_total[lattice_position+0], J_total[lattice_position+1], J_total[lattice_position+2],
-                                      B[lattice_position+0], B[lattice_position+1], B[lattice_position+2])
-            dx, dy, dz = cross_inline(J_total[lattice_position+0], J_total[lattice_position+1], J_total[lattice_position+2],
-                                      px, py, pz)
-
-            dJdt[lattice_position+0] = prefactors_S[i] * (px + alphaS_list[i] * dx)
-            dJdt[lattice_position+1] = prefactors_S[i] * (py + alphaS_list[i] * dy)
-            dJdt[lattice_position+2] = prefactors_S[i] * (pz + alphaS_list[i] * dz)
-
-            # --- L ---
-            px, py, pz = cross_inline(J_total[lattice_position+3], J_total[lattice_position+4], J_total[lattice_position+5],
-                                      B[lattice_position+3], B[lattice_position+4], B[lattice_position+5])
-            dx, dy, dz = cross_inline(J_total[lattice_position+3], J_total[lattice_position+4], J_total[lattice_position+5],
-                                      px, py, pz)
-
-            dJdt[lattice_position+3] = prefactors_L[i] * (px + alphaL_list[i] * dx)
-            dJdt[lattice_position+4] = prefactors_L[i] * (py + alphaL_list[i] * dy)
-            dJdt[lattice_position+5] = prefactors_L[i] * (pz + alphaL_list[i] * dz)
-            
-
-        #dJdt[np.abs(dJdt) < 1e-15] = 0.0
-        return dJdt
-    
-    @njit
-    def dampingOnly(I_list,J_total):
-        dJdt = np.empty(dataset_length, dtype=np.float64)
-        B = B_func(I_list, J_total)
-
-        for i in range(len(I_list)):
-            lattice_position = 6*i
-
-            # --- S ---
-            px, py, pz = cross_inline(J_total[lattice_position+0], J_total[lattice_position+1], J_total[lattice_position+2],
-                                      B[lattice_position+0], B[lattice_position+1], B[lattice_position+2])
-            dx, dy, dz = cross_inline(J_total[lattice_position+0], J_total[lattice_position+1], J_total[lattice_position+2],
-                                      px, py, pz)
-
-            dJdt[lattice_position+0] = prefactors_S[i] * (alphaS_list[i] * dx)
-            dJdt[lattice_position+1] = prefactors_S[i] * (alphaS_list[i] * dy)
-            dJdt[lattice_position+2] = prefactors_S[i] * (alphaS_list[i] * dz)
-
-            # --- L ---
-            px, py, pz = cross_inline(J_total[lattice_position+3], J_total[lattice_position+4], J_total[lattice_position+5],
-                                      B[lattice_position+3], B[lattice_position+4], B[lattice_position+5])
-            dx, dy, dz = cross_inline(J_total[lattice_position+3], J_total[lattice_position+4], J_total[lattice_position+5],
-                                      px, py, pz)
-
-            dJdt[lattice_position+3] = prefactors_L[i] * (alphaL_list[i] * dx)
-            dJdt[lattice_position+4] = prefactors_L[i] * (alphaL_list[i] * dy)
-            dJdt[lattice_position+5] = prefactors_L[i] * (alphaL_list[i] * dz)
-
-        dJdt[np.abs(dJdt) < 1e-15] = 0.0
-        return dJdt
-    
-    @njit
-    def precessionOnly(I_list,J_total):
-        dJdt = np.empty(dataset_length, dtype=np.float64)
-        B = B_func(I_list, J_total)
-
-        for i in range(len(I_list)):
-            lattice_position = 6*i
-
-            # --- S ---
-            px, py, pz = cross_inline(J_total[lattice_position+0], J_total[lattice_position+1], J_total[lattice_position+2],
-                                      B[lattice_position+0], B[lattice_position+1], B[lattice_position+2])
-            
-            dJdt[lattice_position+0] = prefactors_S[i] * (px)
-            dJdt[lattice_position+1] = prefactors_S[i] * (py)
-            dJdt[lattice_position+2] = prefactors_S[i] * (pz)
-
-            # --- L ---
-            px, py, pz = cross_inline(J_total[lattice_position+3], J_total[lattice_position+4], J_total[lattice_position+5],
-                                      B[lattice_position+3], B[lattice_position+4], B[lattice_position+5])
-            
-            dJdt[lattice_position+3] = prefactors_L[i] * (px)
-            dJdt[lattice_position+4] = prefactors_L[i] * (py)
-            dJdt[lattice_position+5] = prefactors_L[i] * (pz)
-
-        dJdt[np.abs(dJdt) < 1e-15] = 0.0
-        return dJdt
-    
-    match dynamics:
-       case "full":
-           toReturn = fullLLGs
-       case "damping":
-           toReturn = dampingOnly
-       case "precession":
-           toReturn = precessionOnly    
-
-    return toReturn
-
-
-
-#=========
-#Dynamics
-#=========
-
-def findEquilibrium_multi_withDamping(J0_total, fmrFieldFunction_list,parameters_list, t_max = 1e-6, torquetol = 1e-9, returnEvolution = False, rel_tol=1e-10, abs_tol=1e-10, method="Radau"):
-    parameters_copy = copy.deepcopy(parameters_list)
-    for parameter_set in parameters_copy:
-        parameter_set["alphaS"] = 1
-        parameter_set["alphaL"] = 1
-
-    LLGs = get_LLGs_multi(parameters_copy, "damping")
-    t_span = (0, t_max)
-
-    
-    def LLG_wrapper(t, J_total):
-        I_list = np.array([fun(t) for fun in fmrFieldFunction_list], dtype=np.float64)
-        #for i in range(len(fmrFieldFunction_list)):
-        #    I_list[i] = fmrFieldFunction_list[i](t)
+    if currentFunc is None:
+        @njit
+        def currentFunc(t):
+            return noEffect(t,N)
         
-        return LLGs(I_list, J_total)
+    if not isinstance(currentFunc, CPUDispatcher):
+        raise TypeError(f"{currentFunc.__name__} must be a numba compiled function")
 
-    def equilibrium_event(t,J):
-        dJdt = LLG_wrapper(t,J)
-        return np.sqrt(np.sum(dJdt**2))-torquetol
-    equilibrium_event.terminal = True
-    equilibrium_event.direction = -1
+    @njit
+    def LLG(t,J):
+        dJdt = np.empty((6, N), dtype=np.float64)
+        I = currentFunc(t)
+        B = field_func(I,J)
+        for i in range(N):
+            
 
-    sol = solve_ivp(
-        LLG_wrapper,
-        t_span,
-        J0_total,
-        rtol = rel_tol,
-        atol = abs_tol,
-        method=method,
-        events=equilibrium_event
-    )
+            
 
-    if returnEvolution:
-        return sol
+            Sx = J[0,i]
+            Sy = J[1,i]
+            Sz = J[2,i]
+            Lx = J[3,i]
+            Ly = J[4,i]
+            Lz = J[5,i]
+
+            BSx = B[0,i]
+            BSy = B[1,i]
+            BSz = B[2,i]
+            BLx = B[3,i]
+            BLy = B[4,i]
+            BLz = B[5,i]
+
+            pref_S = prefactors_S[i]
+            pref_L = prefactors_L[i]
+            alpha_S = alphaS_set[i]
+            alpha_L = alphaL_set[i]
+
+
+
+            px = Sy*BSz -  BSy*Sz
+            py = -Sx*BSz +  BSx*Sz
+            pz = Sx*BSy -  BSx*Sy
+
+            
+
+            if fullMode:
+                dx = Sy*pz -  py*Sz
+                dy = -Sx*pz +  px*Sz
+                dz = Sx*py -  px*Sy
+
+                sx = px + alpha_S * dx
+                sy = py + alpha_S * dy
+                sz = pz + alpha_S * dz
+            elif dampingMode:
+                dx = Sy*pz -  py*Sz
+                dy = -Sx*pz +  px*Sz
+                dz = Sx*py -  px*Sy
+
+                sx = alpha_S * dx
+                sy = alpha_S * dy
+                sz = alpha_S * dz
+            else:  # precession
+                sx = px
+                sy = py
+                sz = pz
+
+
+            dJdt[0,i]=pref_S * sx
+            dJdt[1,i]=pref_S * sy
+            dJdt[2,i]=pref_S * sz
+
+
+
+            px = Ly*BLz -  BLy*Lz
+            py = -Lx*BLz +  BLx*Lz
+            pz = Lx*BLy -  BLx*Ly
+
+
+            if fullMode:
+                dx = Ly*pz -  py*Lz
+                dy = -Lx*pz +  px*Lz
+                dz = Lx*py -  px*Ly
+
+                lx = px + alpha_L * dx
+                ly = py + alpha_L * dy
+                lz = pz + alpha_L * dz
+            elif dampingMode:
+                dx = Ly*pz -  py*Lz
+                dy = -Lx*pz +  px*Lz
+                dz = Lx*py -  px*Ly
+
+                lx = alpha_L * dx
+                ly = alpha_L * dy
+                lz = alpha_L * dz
+            else:  # precession
+                lx = px
+                ly = py
+                lz = pz
+
+
+            dJdt[3,i]=pref_L * lx
+            dJdt[4,i]=pref_L * ly
+            dJdt[5,i]=pref_L * lz
+
+
+        return dJdt
+    
+
+
+    return LLG
+
+
+def timeEvol(J0, parameters, fmrFieldFunction, tf, dt = 1e-10, t0 = 0, dynamics = "full", save_every = 100, stream = False):
+    LLGs = get_LLGs(parameters, dynamics, fmrFieldFunction)
+    n_step = int((tf-t0)/dt)
+    
+    N = J0.shape[1]
+
+    estimated_bytes = 6 * N * (n_step+1) * 8
+
+    if estimated_bytes > 1e9 or stream:  # ~1 GB threshold
+        print("Using streaming RK4")
+        return RK4_stream_integrator(J0, t0, tf, dt, LLGs, save_every=save_every)
     else:
-        return sol.y[:,-1]
-
-
-def timeEvolution_multi(J0_total, parameters_list, fmrFieldFunction_list, t_f, t_i=0, rel_tol=1e-10, abs_tol=1e-10, method="Radau", relaxFirst = True, max_step = 1e-8, min_step = None):
-    """
-    J0 : initial 6-vector
-    LLG_numba : Numba'd derivative function LLG(I, J)
-    fmrFieldFunction : function of t returning I(t)
-    """
-    t_span = (t_i, t_f)
-
-    LLG_numba = get_LLGs_multi(parameters_list)
-    
-    
-    def LLG_wrapper(t, J_total):
-        I_list = np.array([fun(t) for fun in fmrFieldFunction_list], dtype=np.float64)
-        #for i in range(len(fmrFieldFunction_list)):
-        #    I_list[i] = fmrFieldFunction_list[i](t)
-        
-        return LLG_numba(I_list, J_total)
-    
-    if relaxFirst:
-        J0_total = findEquilibrium_multi_withDamping(J0_total, [noEffect for i in range(len(fmrFieldFunction_list))], parameters_list)
-        print("equilibrium reached")
-        
-    sol = solve_ivp(
-        LLG_wrapper,
-        t_span,
-        J0_total,
-        rtol=rel_tol,
-        atol=abs_tol,
-        method=method,
-        max_step=max_step,
-        min_step = min_step
-    )
-    return sol
-
-
-class SimSolution():
-    def __init__(self, parameters, solution):
-        self.t = solution.t
-        self.parameters = parameters
-        self.J = solution.y
-
-class MultiSimSolution(SimSolution):
-    def __init__(self, parameters_list, solution):
-        super().__init__(parameters_list, solution)
-        self.num_layers = len(parameters_list)
-        self.J = self.J.reshape(self.num_layers, 6, -1)
-
-    def getM(self):
-        M_S = np.array([self.parameters[i]["S_fraction"]*self.J[i,:3,:] for i in range(len(self.parameters))])
-        M_L = np.array([(1-self.parameters[i]["S_fraction"])*self.J[i,3:,:] for i in range(len(self.parameters))])
-        return M_S+M_L
-
-    def getFFT(self, t0 = 0, actOn="M"):
-
-        match actOn:
-            case "M":
-                data = self.getM
-                attributeName = "fft_M"
-            case "S":
-                data = self.J[:,:3,:]
-                attributeName = "fft_S"
-            case "L":
-                data = self.J[:,3:,:]  
-                attributeName = "fft_L"  
-
-
-        uniform_t = np.linspace(self.t[0], self.t[-1], 10*len(self.t))
-        interp = interp1d(self.t, data[:,1,:], kind = "cubic", axis = -1)
-        Y_uniform = interp(uniform_t)
-
-        post_idx = uniform_t>t0
-        fft_y = Y_uniform[post_idx]
-        dt = uniform_t[1]-uniform_t[0]
-        freqs = np.fft.fftfreq(fft_y.shape[-1], dt)
-        Y_fft = np.fft.fft(fft_y, axis = -1)
-
-        #for index in parameterSet_indeces:
-        #    uniform_t = np.linspace(self.t[0], self.t[-1],10*len(self.t))
-        #    interp = interp1d(self.t, data[index,1,:], kind = "cubic")
-        #    My_uniform = interp(uniform_t)
-        #    post_idx = uniform_t > t0
-        #    #fft_t = uniform_t[post_idx]
-        #    fft_my = My_uniform[post_idx]
-        #    dt = uniform_t[1]-uniform_t[0]
-        #    freqs = np.fft.fftfreq(len(fft_my), dt)
-        #    fftMy = np.fft.fft(fft_my)
-
-
-
-        setattr(self,attributeName,Y_fft)
-        if not hasattr(self,"fftFreqs"):
-            self.fftFreqs = freqs
-        
+        print("Using full RK4")
+        return RK4_integrator(J0, t0, tf, dt, LLGs)
 
 
 
 
 if __name__ ==   "__main__":
-    for s_frac in [0,.1,.2,.3,.4,.5,.6,.7,.7,.8,.9,.95,.99]:
+    import time
+
+    t0 = time.perf_counter()
+
+    for s_frac in [.5]:
         print("Starting s_frac = ", s_frac)
         parameters_base={
             "B0":1,
-            "uB":np.array([1,0,0]),
+            "uB":np.array([0,1,0]),
             "M": 0/mu0,
             "N_diag": np.array([0,0,1]),
             "Bk": 0,
             "uK": np.array([1,0,0]),
             "anisotropy_affects_S": False,
-            "BOe": 1e-3,
+            "BOe": 1e-4,
             "Bfl_l": 0,
             "Bdl_l": 0,
             "Bfl_s": 0,
@@ -430,45 +494,47 @@ if __name__ ==   "__main__":
         parameters_base = sanitizeParameters(parameters_base)
 
         parametersList = [parameters_base for i in range(length)]
-        test=get_LLGs_multi(parametersList)
-        B = totalField_multi(parametersList)
 
-        #B_so_list = [.01,0,1]
-        #B_so_list = B_so_list + [*reversed([-B for B in B_so_list])]
 
-        def tanh_space(n, val_range, val_scale = 3):
-            x = np.linspace(-.99,.99,n)
-            y = np.tan(x*np.pi/2)
-            return val_range * y
 
-        B_so_list = np.concatenate([-np.logspace(3, -2,100),np.array([0]),np.logspace(-2, 3,100)])
 
-        #B_so_list = np.linspace(-100, 100, 100)
+        B_so_list = np.concatenate([-np.logspace(3, -2,50),np.array([0]),np.logspace(-2, 3,50)])
+
 
         parameters_list = [copy.deepcopy(parameters_base) for B in B_so_list]
 
         for parameter, B in zip(parameters_list,B_so_list):
             parameter["Bso"] = B 
 
-        J0_total = np.array([[1,0,0,1,0,0] for B in B_so_list]).flatten()
+        J0_total = np.array([[1,0,0,1,0,0] for B in B_so_list]).T
 
         f_max = 100e12
-        t_0 = 5e-9
+        f_min = 5e9
+        T = 10e-9
+        max_step = 1/(10*f_max)
+        sigma = max_step
 
-        @njit
-        def sinc_pulse(t):
-            return np.sinc(f_max*(t-t_0))
-
-        function_list = [sinc_pulse for i in B_so_list]
-
-        plt.scatter([i for i in range(len(B_so_list))],B_so_list)
-
-        results = timeEvolution_multi(J0_total,parameters_list,function_list,100e-9, relaxFirst=True, max_step=1e-10)
+        k = np.log(f_max/f_min)
         
+        t_0 = 1e-9
 
-        temp = MultiSimSolution(parameters_list,results)
+        N = len(parameters_list)
+        parameters_list = SimulationParams(parameters_list)
 
-        os.makedirs(r"D:\data\sims", exist_ok=True)
+        
+        @njit
+        def gaussian_pulse(t):
+            #return np.ones(N)*np.exp(-(t-t_0)**2/(2*sigma**2))
+            return np.sin(f_max*(t-t_0))*np.ones(N)
 
-        with open(rf"D:\data\sims/fraction{int(s_frac*100)}%.pkl","wb") as f:
-            pkl.dump(temp, f) 
+        B = make_effective_field(parameters_list)
+        test=get_LLGs(parameters_list)
+
+        #results = timeEvol(J0_total,parameters_list,None,1e-15, dt=1e-15)
+        
+        results = timeEvol(J0_total,parameters_list,None,1e-8, dt=1e-15, save_every = 100)
+        print(np.shape(results[1]))
+
+    t1 = time.perf_counter()
+
+    print(f"sim time: {t1-t0:.6f} s")
